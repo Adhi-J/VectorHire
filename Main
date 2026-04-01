@@ -1,0 +1,403 @@
+import * as pdfjs from 'pdfjs-dist';
+
+// This line is mandatory for PDF.js to work in a browser
+pdfjs.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.js`;
+
+import { useState, useRef, useCallback } from "react";
+
+const CLAUDE_MODEL = "claude-sonnet-4-20250514";
+
+const MOCK_JOBS = [
+  { id: 1, title: "Senior React Developer", count: 0, date: "2026-03-20" },
+  { id: 2, title: "ML Engineer", count: 0, date: "2026-03-22" },
+];
+
+function callClaude(messages, systemPrompt) {
+  return fetch(// Add this proxy prefix to bypass the browser's "security guard"
+const proxyUrl = "https://cors-anywhere.herokuapp.com/"; 
+const apiUrl = "https://api.anthropic.com/v1/messages";
+
+function callClaude(messages, systemPrompt) {
+  return fetch(proxyUrl + apiUrl, { // <--- Added proxyUrl here
+    method: "POST",
+    headers: { 
+      "Content-Type": "application/json",
+      "x-api-key": "YOUR_ACTUAL_CLAUDE_KEY_HERE", // Add your key
+      "anthropic-version": "2023-06-01" 
+    },
+    // ... rest of your code, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: 1000,
+      system: systemPrompt,
+      messages,
+    }),
+  }).then((r) => r.json());
+}
+
+async function readFileAsText(file) {
+  if (file.type === "application/pdf") {
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+    let fullText = "";
+
+    // Loop through every page and grab the text
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      // Join all the little text fragments into one string
+      fullText += content.items.map(item => item.str).join(" ") + "\n";
+    }
+    return fullText;
+  }
+  
+  // Keep the fallback for standard text files
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => resolve(e.target.result);
+    reader.readAsText(file);
+  });
+}
+
+
+async function parseResume(text, filename) {
+  const sys = `You are a resume parser. Extract structured info from resume text and return ONLY valid JSON, no markdown, no explanation. JSON shape: {"name":"string","email":"string","phone":"string","summary":"string","skills":["string"],"totalYearsExp":number,"experience":[{"company":"string","role":"string","duration":"string","highlights":["string"]}],"education":[{"degree":"string","institution":"string","year":"string"}],"certifications":["string"]}. If info is missing, use empty string/array/0. Infer skills from context (e.g. JVM->Java, PyTorch->ML). totalYearsExp should be estimated number.`;
+  const data = await callClaude([{ role: "user", content: `Parse this resume:\n\nFilename: ${filename}\n\n${text}` }], sys);
+  const raw = data.content?.[0]?.text || "{}";
+  try {
+    const clean = raw.replace(/```json|```/g, "").trim();
+    return JSON.parse(clean);
+  } catch {
+    return { name: filename.replace(/\.[^.]+$/, ""), skills: [], totalYearsExp: 0, experience: [], education: [], certifications: [], summary: "" };
+  }
+}
+
+async function rankCandidates(candidates, jd) {
+  const sys = `You are an expert technical recruiter. Given a job description and candidate profiles, rank candidates and return ONLY valid JSON array. Each element: {"id":number,"score":number,"justification":"string","matchedSkills":["string"],"gaps":["string"]}. score is 0-100. justification is exactly 2 sentences explaining why ranked here. No markdown, no extra text.`;
+  const prompt = `Job Description:\n${jd}\n\nCandidates:\n${candidates.map((c, i) => `ID ${i}: ${c.name} | Skills: ${c.skills?.join(", ")} | Exp: ${c.totalYearsExp} yrs | Summary: ${c.summary}`).join("\n")}`;
+  const data = await callClaude([{ role: "user", content: prompt }], sys);
+  const raw = data.content?.[0]?.text || "[]";
+  try {
+    const clean = raw.replace(/```json|```/g, "").trim();
+    return JSON.parse(clean);
+  } catch {
+    return [];
+  }
+}
+
+const statusColor = (s) => ({ parsed: "var(--color-text-success)", parsing: "var(--color-text-warning)", error: "var(--color-text-danger)", uploading: "var(--color-text-secondary)" }[s] || "var(--color-text-secondary)");
+const statusLabel = (s) => ({ parsed: "✓ Parsed", parsing: "Parsing…", error: "✗ Error", uploading: "Uploading…" }[s] || s);
+
+export default function App() {
+  const [view, setView] = useState("dashboard");
+  const [jobs, setJobs] = useState(MOCK_JOBS);
+  const [selectedJob, setSelectedJob] = useState(null);
+  const [resumes, setResumes] = useState([]);
+  const [jd, setJd] = useState("");
+  const [rankings, setRankings] = useState([]);
+  const [ranking, setRanking] = useState(false);
+  const [filterSkill, setFilterSkill] = useState("");
+  const [filterExp, setFilterExp] = useState("");
+  const [newJobTitle, setNewJobTitle] = useState("");
+  const [addingJob, setAddingJob] = useState(false);
+  const fileRef = useRef();
+
+  const handleFiles = useCallback(async (files, jobId) => {
+    const arr = Array.from(files).filter(f => /\.(pdf|docx|txt|png|jpg|jpeg)$/i.test(f.name));
+    if (!arr.length) return;
+    const entries = arr.map((f) => ({ id: Date.now() + Math.random(), file: f, name: f.name, status: "uploading", profile: null }));
+    setResumes((prev) => [...prev, ...entries]);
+    setJobs((prev) => prev.map((j) => j.id === jobId ? { ...j, count: j.count + arr.length } : j));
+
+    for (const entry of entries) {
+      setResumes((prev) => prev.map((r) => r.id === entry.id ? { ...r, status: "parsing" } : r));
+      try {
+        const text = await readFileAsText(entry.file);
+        const profile = await parseResume(text, entry.name);
+        setResumes((prev) => prev.map((r) => r.id === entry.id ? { ...r, status: "parsed", profile, jobId } : r));
+      } catch {
+        setResumes((prev) => prev.map((r) => r.id === entry.id ? { ...r, status: "error" } : r));
+      }
+    }
+  }, []);
+
+  const handleRank = async () => {
+    if (!jd.trim()) return;
+    const pool = resumes.filter((r) => r.status === "parsed" && r.profile);
+    if (!pool.length) return;
+    setRanking(true);
+    try {
+      const results = await rankCandidates(pool.map((r) => r.profile), jd);
+      const merged = results.map((r) => ({ ...r, resume: pool[r.id] })).filter((r) => r.resume);
+      setRankings(merged.sort((a, b) => b.score - a.score));
+      setView("ranking");
+    } finally {
+      setRanking(false);
+    }
+  };
+
+  const addJob = () => {
+    if (!newJobTitle.trim()) return;
+    setJobs((prev) => [...prev, { id: Date.now(), title: newJobTitle.trim(), count: 0, date: new Date().toISOString().slice(0, 10) }]);
+    setNewJobTitle("");
+    setAddingJob(false);
+  };
+
+  const filteredRankings = rankings.filter((r) => {
+    const skills = r.resume?.profile?.skills || [];
+    const exp = r.resume?.profile?.totalYearsExp || 0;
+    const skillMatch = !filterSkill || skills.some((s) => s.toLowerCase().includes(filterSkill.toLowerCase()));
+    const expMatch = !filterExp || exp >= parseInt(filterExp);
+    return skillMatch && expMatch;
+  });
+
+  const jobResumes = selectedJob ? resumes.filter((r) => r.jobId === selectedJob.id) : resumes;
+
+  const styles = {
+    app: { fontFamily: "var(--font-sans)", minHeight: "100vh", background: "var(--color-background-tertiary)", color: "var(--color-text-primary)" },
+    sidebar: { width: 220, background: "var(--color-background-primary)", borderRight: "0.5px solid var(--color-border-tertiary)", padding: "24px 0", position: "fixed", top: 0, left: 0, bottom: 0, display: "flex", flexDirection: "column" },
+    logo: { padding: "0 24px 24px", borderBottom: "0.5px solid var(--color-border-tertiary)", marginBottom: 8 },
+    logoTitle: { fontSize: 15, fontWeight: 500, margin: 0, letterSpacing: "-0.3px" },
+    logoSub: { fontSize: 12, color: "var(--color-text-secondary)", margin: "2px 0 0" },
+    navItem: (active) => ({ padding: "10px 24px", fontSize: 14, cursor: "pointer", color: active ? "var(--color-text-primary)" : "var(--color-text-secondary)", background: active ? "var(--color-background-secondary)" : "transparent", borderLeft: active ? "2px solid var(--color-text-primary)" : "2px solid transparent", transition: "all 0.15s" }),
+    main: { marginLeft: 220, padding: "32px 40px", minHeight: "100vh" },
+    pageTitle: { fontSize: 22, fontWeight: 500, margin: "0 0 6px", letterSpacing: "-0.5px" },
+    pageSub: { fontSize: 14, color: "var(--color-text-secondary)", margin: "0 0 28px" },
+    card: { background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: "20px 24px", marginBottom: 16 },
+    metricCard: { background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "16px 20px", flex: 1 },
+    metricLabel: { fontSize: 13, color: "var(--color-text-secondary)", margin: "0 0 4px" },
+    metricVal: { fontSize: 28, fontWeight: 500, margin: 0 },
+    btn: { padding: "8px 18px", fontSize: 14, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-md)", cursor: "pointer", color: "var(--color-text-primary)" },
+    btnPrimary: { padding: "8px 18px", fontSize: 14, background: "var(--color-text-primary)", border: "none", borderRadius: "var(--border-radius-md)", cursor: "pointer", color: "var(--color-background-primary)", fontWeight: 500 },
+    badge: (color) => ({ fontSize: 11, padding: "2px 8px", borderRadius: 99, background: `var(--color-background-${color})`, color: `var(--color-text-${color})`, fontWeight: 500 }),
+    input: { padding: "8px 12px", fontSize: 14, background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-md)", color: "var(--color-text-primary)", width: "100%", boxSizing: "border-box" },
+    scoreBar: (pct) => ({ height: 6, borderRadius: 99, background: `linear-gradient(90deg, ${pct >= 75 ? "#1D9E75" : pct >= 50 ? "#EF9F27" : "#E24B4A"} ${pct}%, var(--color-background-secondary) ${pct}%)` }),
+    table: { width: "100%", borderCollapse: "collapse", fontSize: 14 },
+    th: { textAlign: "left", padding: "10px 14px", fontSize: 12, color: "var(--color-text-secondary)", fontWeight: 500, borderBottom: "0.5px solid var(--color-border-tertiary)" },
+    td: { padding: "12px 14px", borderBottom: "0.5px solid var(--color-border-tertiary)", verticalAlign: "top" },
+    dropzone: { border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)", padding: "40px 24px", textAlign: "center", cursor: "pointer", background: "var(--color-background-secondary)" },
+    tag: { fontSize: 12, padding: "3px 8px", borderRadius: 99, background: "var(--color-background-secondary)", color: "var(--color-text-secondary)", display: "inline-block", margin: "2px" },
+  };
+
+  const navItems = [
+    { id: "dashboard", label: "Dashboard" },
+    { id: "upload", label: "Upload Resumes" },
+    { id: "ranking", label: "Rank Candidates" },
+  ];
+
+  const parsedCount = resumes.filter((r) => r.status === "parsed").length;
+  const allSkills = [...new Set(resumes.flatMap((r) => r.profile?.skills || []))].slice(0, 8);
+
+  return (
+    <div style={styles.app}>
+      <div style={styles.sidebar}>
+        <div style={styles.logo}>
+          <p style={styles.logoTitle}>Smart Talent</p>
+          <p style={styles.logoSub}>Selection Engine</p>
+        </div>
+        {navItems.map((n) => (
+          <div key={n.id} style={styles.navItem(view === n.id)} onClick={() => setView(n.id)}>{n.label}</div>
+        ))}
+        <div style={{ flex: 1 }} />
+        <div style={{ padding: "16px 24px", borderTop: "0.5px solid var(--color-border-tertiary)" }}>
+          <p style={{ fontSize: 12, color: "var(--color-text-tertiary)", margin: 0 }}>Powered by Claude AI</p>
+        </div>
+      </div>
+
+      <div style={styles.main}>
+        {view === "dashboard" && (
+          <div>
+            <p style={styles.pageTitle}>Recruiter Dashboard</p>
+            <p style={styles.pageSub}>Overview of active job roles and candidate pipeline</p>
+
+            <div style={{ display: "flex", gap: 12, marginBottom: 28 }}>
+              {[{ label: "Active Roles", val: jobs.length }, { label: "Resumes Uploaded", val: resumes.length }, { label: "Parsed & Ready", val: parsedCount }, { label: "Top Match Score", val: rankings.length ? `${rankings[0]?.score}%` : "—" }].map((m) => (
+                <div key={m.label} style={styles.metricCard}>
+                  <p style={styles.metricLabel}>{m.label}</p>
+                  <p style={styles.metricVal}>{m.val}</p>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <p style={{ fontSize: 16, fontWeight: 500, margin: 0 }}>Job Roles</p>
+              <button style={styles.btn} onClick={() => setAddingJob(true)}>+ New Role</button>
+            </div>
+
+            {addingJob && (
+              <div style={{ ...styles.card, display: "flex", gap: 12, alignItems: "center", marginBottom: 16 }}>
+                <input style={{ ...styles.input, maxWidth: 320 }} placeholder="e.g. Senior Backend Engineer" value={newJobTitle} onChange={(e) => setNewJobTitle(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addJob()} />
+                <button style={styles.btnPrimary} onClick={addJob}>Add</button>
+                <button style={styles.btn} onClick={() => setAddingJob(false)}>Cancel</button>
+              </div>
+            )}
+
+            {jobs.map((job) => (
+              <div key={job.id} style={{ ...styles.card, display: "flex", alignItems: "center", gap: 16 }}>
+                <div style={{ flex: 1 }}>
+                  <p style={{ margin: "0 0 4px", fontWeight: 500 }}>{job.title}</p>
+                  <p style={{ margin: 0, fontSize: 13, color: "var(--color-text-secondary)" }}>Created {job.date} · {job.count} resumes</p>
+                </div>
+                {rankings.length > 0 && resumes.filter(r => r.jobId === job.id).length > 0 && (
+                  <div>
+                    <p style={{ margin: 0, fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 4 }}>Top talent</p>
+                    {rankings.slice(0, 2).map((r) => (
+                      <div key={r.id} style={{ fontSize: 13, display: "flex", gap: 8, alignItems: "center" }}>
+                        <span>{r.resume?.profile?.name || r.resume?.name}</span>
+                        <span style={styles.badge(r.score >= 75 ? "success" : "warning")}>{r.score}%</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <button style={styles.btn} onClick={() => { setSelectedJob(job); setView("upload"); }}>Upload Resumes</button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {view === "upload" && (
+          <div>
+            <p style={styles.pageTitle}>Upload & Parse Resumes</p>
+            <p style={styles.pageSub}>Drag and drop or select resume files — Claude will extract and structure every profile</p>
+
+            <div style={{ ...styles.card, marginBottom: 20 }}>
+              <p style={{ fontSize: 14, fontWeight: 500, margin: "0 0 12px" }}>Select Job Role</p>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {jobs.map((j) => (
+                  <button key={j.id} style={{ ...styles.btn, background: selectedJob?.id === j.id ? "var(--color-text-primary)" : undefined, color: selectedJob?.id === j.id ? "var(--color-background-primary)" : undefined }} onClick={() => setSelectedJob(j)}>{j.title}</button>
+                ))}
+              </div>
+            </div>
+
+            <div style={styles.dropzone} onClick={() => fileRef.current?.click()} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); selectedJob && handleFiles(e.dataTransfer.files, selectedJob.id); }}>
+              <input ref={fileRef} type="file" multiple accept=".pdf,.docx,.txt,.png,.jpg,.jpeg" style={{ display: "none" }} onChange={(e) => selectedJob && handleFiles(e.target.files, selectedJob.id)} />
+              <p style={{ fontSize: 32, margin: "0 0 8px" }}>↑</p>
+              <p style={{ margin: "0 0 6px", fontWeight: 500 }}>{selectedJob ? `Upload for: ${selectedJob.title}` : "Select a job role first"}</p>
+              <p style={{ fontSize: 13, color: "var(--color-text-secondary)", margin: 0 }}>PDF, DOCX, TXT, JPG, PNG supported</p>
+            </div>
+
+            {resumes.length > 0 && (
+              <div style={styles.card}>
+                <p style={{ fontWeight: 500, margin: "0 0 16px" }}>Processing Queue ({resumes.length} files)</p>
+                {resumes.map((r) => (
+                  <div key={r.id} style={{ display: "flex", alignItems: "flex-start", gap: 12, padding: "12px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: r.profile ? 6 : 0 }}>
+                        <span style={{ fontSize: 14, fontWeight: 500 }}>{r.profile?.name || r.name}</span>
+                        <span style={{ fontSize: 12, color: statusColor(r.status) }}>{statusLabel(r.status)}</span>
+                      </div>
+                      {r.profile && (
+                        <div>
+                          <div style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 6 }}>
+                            {r.profile.totalYearsExp > 0 && <span style={{ marginRight: 12 }}>{r.profile.totalYearsExp} yrs exp</span>}
+                            {r.profile.email && <span style={{ marginRight: 12 }}>{r.profile.email}</span>}
+                          </div>
+                          <div>{(r.profile.skills || []).slice(0, 8).map((s) => <span key={s} style={styles.tag}>{s}</span>)}</div>
+                        </div>
+                      )}
+                    </div>
+                    {r.status === "parsing" && <span style={{ fontSize: 20, animation: "spin 1s linear infinite" }}>⟳</span>}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {parsedCount > 0 && (
+              <div style={{ marginTop: 20 }}>
+                <button style={styles.btnPrimary} onClick={() => setView("ranking")}>Proceed to Ranking ({parsedCount} candidates ready) →</button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {view === "ranking" && (
+          <div>
+            <p style={styles.pageTitle}>JD-to-Candidate Ranking</p>
+            <p style={styles.pageSub}>Paste a job description and Claude will score and rank all parsed candidates semantically</p>
+
+            <div style={styles.card}>
+              <p style={{ fontWeight: 500, margin: "0 0 10px" }}>Job Description</p>
+              <textarea style={{ ...styles.input, minHeight: 140, resize: "vertical", fontFamily: "var(--font-sans)" }} placeholder="Paste the full job description here — required skills, responsibilities, qualifications..." value={jd} onChange={(e) => setJd(e.target.value)} />
+              <div style={{ marginTop: 14, display: "flex", gap: 10, alignItems: "center" }}>
+                <button style={styles.btnPrimary} onClick={handleRank} disabled={ranking || !jd.trim() || parsedCount === 0}>
+                  {ranking ? "Ranking candidates…" : `Rank ${parsedCount} Candidates`}
+                </button>
+                {parsedCount === 0 && <span style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>No parsed resumes yet — upload some first</span>}
+              </div>
+            </div>
+
+            {rankings.length > 0 && (
+              <div>
+                <div style={{ ...styles.card, display: "flex", gap: 12, alignItems: "flex-end" }}>
+                  <div style={{ flex: 1 }}>
+                    <p style={{ fontSize: 13, color: "var(--color-text-secondary)", margin: "0 0 6px" }}>Filter by skill</p>
+                    <input style={styles.input} placeholder="e.g. React, Python…" value={filterSkill} onChange={(e) => setFilterSkill(e.target.value)} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <p style={{ fontSize: 13, color: "var(--color-text-secondary)", margin: "0 0 6px" }}>Min. years experience</p>
+                    <input style={styles.input} type="number" placeholder="e.g. 3" value={filterExp} onChange={(e) => setFilterExp(e.target.value)} />
+                  </div>
+                  <button style={styles.btn} onClick={() => { setFilterSkill(""); setFilterExp(""); }}>Clear</button>
+                </div>
+
+                <div style={{ ...styles.card, padding: 0, overflow: "hidden" }}>
+                  <table style={styles.table}>
+                    <thead>
+                      <tr>
+                        <th style={{ ...styles.th, width: 36 }}>#</th>
+                        <th style={styles.th}>Candidate</th>
+                        <th style={{ ...styles.th, width: 120 }}>Score</th>
+                        <th style={styles.th}>Top Skills</th>
+                        <th style={{ ...styles.th, width: 80, textAlign: "center" }}>Exp</th>
+                        <th style={styles.th}>AI Justification</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredRankings.map((r, i) => {
+                        const profile = r.resume?.profile || {};
+                        return (
+                          <tr key={r.id} style={{ background: i < 5 ? "var(--color-background-secondary)" : undefined }}>
+                            <td style={{ ...styles.td, color: "var(--color-text-tertiary)", fontSize: 13 }}>{i + 1}</td>
+                            <td style={styles.td}>
+                              <div style={{ fontWeight: 500, fontSize: 14 }}>{profile.name || r.resume?.name}</div>
+                              {profile.email && <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{profile.email}</div>}
+                            </td>
+                            <td style={styles.td}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                <span style={{ fontSize: 16, fontWeight: 500 }}>{r.score}%</span>
+                                {i < 5 && <span style={styles.badge(r.score >= 75 ? "success" : "warning")}>{i === 0 ? "top pick" : "shortlist"}</span>}
+                              </div>
+                              <div style={{ ...styles.scoreBar(r.score), marginTop: 6, width: 80 }} />
+                            </td>
+                            <td style={styles.td}>
+                              <div style={{ display: "flex", flexWrap: "wrap" }}>
+                                {(r.matchedSkills || profile.skills || []).slice(0, 5).map((s) => <span key={s} style={styles.tag}>{s}</span>)}
+                              </div>
+                            </td>
+                            <td style={{ ...styles.td, textAlign: "center", fontSize: 14 }}>{profile.totalYearsExp || "—"}y</td>
+                            <td style={{ ...styles.td, fontSize: 13, color: "var(--color-text-secondary)", maxWidth: 320 }}>
+                              {i < 5 ? r.justification : <span style={{ color: "var(--color-text-tertiary)" }}>—</span>}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+        button:hover { opacity: 0.85; }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
+        textarea:focus, input:focus { outline: none; border-color: var(--color-border-primary); }
+      `}</style>
+    </div>
+  );
+}
